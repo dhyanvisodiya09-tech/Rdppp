@@ -1,28 +1,31 @@
-name: RDP
+Name: RDP
 
 on:
+  # Allows manual triggering of the workflow
   workflow_dispatch:
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    # Set a long timeout for the RDP session
+    timeout-minutes: 3600 
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          # Enable Remote Desktop and disable Network Level Authentication (NLA)
+          # Disabling NLA is generally required for RDP on GitHub-hosted runners unless using a specific user setup.
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 0 -Force # 0 = NLA Disabled
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 0 -Force # 0 = RDP Security Layer
 
-          # Remove any existing rule with the same name to avoid duplication
+          # Remove any existing firewall rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # For testing, allow any incoming connection on port 3389
+          # Allow any incoming connection on port 3389 (RDP)
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
@@ -30,7 +33,9 @@ jobs:
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
+        id: create_user
         run: |
+          # --- Password Generation Logic ---
           Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)      # A-Z
@@ -45,21 +50,31 @@ jobs:
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
+          # --- End Password Generation Logic ---
+          
+          # Use a secure string for the password
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create the local user 'RDP'
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          
+          # Add the user to necessary groups
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
+          # Check for successful user creation
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
 
+          # Output the generated password as a secret *workflow output*
+          # This is the corrected way to pass data between steps safely and cleanly.
+          echo "password=$password" >> $env:GITHUB_OUTPUT
+
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" # Ensure this is the latest stable version if needed
           $installerPath = "$env:TEMP\tailscale.msi"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
@@ -67,6 +82,7 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        id: tailscale_conn
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
@@ -75,7 +91,8 @@ jobs:
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              # Get the IP and trim whitespace/newlines
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
               Start-Sleep -Seconds 5
               $retries++
           }
@@ -84,33 +101,41 @@ jobs:
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          # Output the Tailscale IP as a workflow output
+          echo "tailscale_ip=$tsIP" >> $env:GITHUB_OUTPUT
       
-      - name: Verify RDP Accessibility
+      - name: Verify RDP Accessibility and Output Credentials
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $tsIP = ${{ steps.tailscale_conn.outputs.tailscale_ip }}
+          $rdpPass = ${{ steps.create_user.outputs.password }}
+
+          Write-Host "Tailscale IP: $tsIP"
           
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
           Write-Host "TCP connectivity successful!"
 
+          # Output the access credentials
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $tsIP"
+          Write-Host "Username: RDP"
+          # Mask the password in the logs by using '::add-mask::'
+          # Note: This step uses the password output from the 'create_user' step
+          Write-Host "::add-mask::$rdpPass" 
+          Write-Host "Password: $rdpPass" 
+          Write-Host "==================`n"
+
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "`nKeeping runner active for RDP session..."
+          Write-Host "Stop the workflow manually in the GitHub Actions UI when done."
           
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] RDP Active - Sleeping for 5 minutes..."
               Start-Sleep -Seconds 300
           }
-
-
-Fix the code
